@@ -10,10 +10,12 @@ from standards_bridge.laboratory.certification import advance_for_outcome, decid
 from standards_bridge.artifacts.conformance_report import export_bundle, verify_bundle
 from standards_bridge.mappings.semantic_bridge import derive_context
 
+from standards_bridge.assurance.bundle_certifications import BundleCertifications
 
 class Application:
     def __init__(self, database: str | Path, context: Mapping[str, Any] | None = None):
         self.repository = Repository(database)
+        self.bundle_certifications = BundleCertifications(self.repository)
         self.context = dict(context or {})
 
     def ingest(self, record: DomainRecord) -> DomainRecord:
@@ -64,6 +66,12 @@ class Application:
     def inspect(self) -> dict[str, Any]:
         return {"snapshot": self.repository.snapshot(), "records": [record.__dict__ for record in self.repository.list_records()],
                 "decisions": self.repository.decision_rows()}
+
+    def register_mapping(self, mapping_id: str, source: str, target: str, aliases: dict[str, str]) -> int:
+        return self.repository.register_mapping(mapping_id, source, target, aliases)
+
+    def mapping_impact(self, mapping_id: str) -> dict[str, Any]:
+        return self.repository.mapping_impact(mapping_id)
 
 
 def load_fixture(path: str | Path) -> dict[str, Any]:
