@@ -7,7 +7,7 @@ from typing import Any, Mapping
 from standards_bridge.profiles.specification import ContractError, Decision, DomainRecord, records_from_fixture, stable_hash
 from standards_bridge.assurance.case_ledger import Repository
 from standards_bridge.laboratory.certification import advance_for_outcome, decide
-from standards_bridge.artifacts.conformance_report import export_bundle, verify_bundle
+from standards_bridge.artifacts.conformance_report import export_bundle, inspect_bundle
 from standards_bridge.mappings.semantic_bridge import derive_context
 
 from standards_bridge.assurance.bundle_certifications import BundleCertifications
@@ -41,19 +41,54 @@ class Application:
             self.repository.save_record(advanced, expected_version=stored.version)
         return advanced, decision
 
+    def _process_atomic(self, run_id: str, record: DomainRecord) -> tuple[DomainRecord, Decision]:
+        """Apply one case's record, decision and progress marker in a single transaction.
+
+        A crash therefore leaves either the whole case or none of it, and the
+        run can be resumed without double-counting decisions or record versions.
+        """
+        def build_decision(stored: DomainRecord, connection) -> Decision:
+            context = dict(self.context)
+            context.update(derive_context(stored, self.repository))
+            return decide(stored, context)
+
+        return self.repository.commit_case(run_id, record, build_decision, advance_for_outcome)
+
     def run_fixture(self, fixture: Mapping[str, Any], output: str | Path) -> dict[str, Any]:
         records = records_from_fixture(fixture)
         fixture_hash = stable_hash(fixture)
         run_id = self.repository.begin_run(fixture_hash, len(records))
         completed = self.repository.completed_run(run_id)
         if completed is not None:
-            return completed
-        decisions: dict[str, Decision] = {}
-        final_records: list[DomainRecord] = []
+            # A finished run is only reusable while its delivered bundle still checks out
+            # against both its own manifest and the manifest recorded for this run.
+            delivered = inspect_bundle(output)
+            recorded = (completed.get("manifest") or {}).get("manifest_hash")
+            if not delivered["errors"] and delivered.get("manifest_hash") == recorded:
+                return completed
+            self.repository.reset_run(run_id)
         for record in records:
-            final_record, decision = self.process(record)
-            final_records.append(final_record)
-            decisions[record.record_id] = decision
+            if record.record_id in self.repository.run_progress(run_id):
+                # A prior (possibly interrupted) attempt already committed this case.
+                continue
+            self._process_atomic(run_id, record)
+        # Re-derive the delivered details from the persisted ledger so a resumed or
+        # partially written run cannot drift from what the case ledger actually holds.
+        progress = self.repository.run_progress(run_id)
+        known = {record.record_id for record in records}
+        missing = known - set(progress)
+        if missing:
+            raise ContractError("case ledger is incomplete: " + ", ".join(sorted(missing)))
+        final_records = []
+        decisions: dict[str, Decision] = {}
+        for record in records:
+            stored = self.repository.get_record(record.record_id)
+            marker = progress.get(record.record_id)
+            body = self.repository.decision_row(record.record_id, marker["decision_id"] if marker else None)
+            if stored is None or body is None:
+                raise ContractError(f"case ledger is incomplete for {record.record_id}")
+            final_records.append(stored)
+            decisions[record.record_id] = self.repository.decision_from_json(body)
         snapshot = self.repository.snapshot()
         if snapshot["chain_errors"]:
             raise ContractError("audit chain verification failed")
@@ -91,7 +126,21 @@ def run(fixture_path: str | Path, database: str | Path, output: str | Path,
 
 def verify(database: str | Path, output: str | Path) -> dict[str, Any]:
     repository = Repository(database)
+    application = Application(database)
     chain_errors = repository.verify_chain()
-    bundle_errors = verify_bundle(output)
-    return {"ok": not chain_errors and not bundle_errors, "chain_errors": chain_errors,
-            "bundle_errors": bundle_errors, "snapshot": repository.snapshot()}
+    report = inspect_bundle(output)
+    bundle_errors = list(report["errors"])
+    risk = application.bundle_certifications.risks()
+    blocked_cases = sorted({item["case_id"] for item in risk if item["integrity"] == "blocked"})
+    upgrade_cases = sorted({item["case_id"] for item in risk if item["integrity"] == "legacy"})
+    return {"ok": not chain_errors and not bundle_errors and not blocked_cases,
+            "chain_errors": chain_errors,
+            "bundle_errors": bundle_errors,
+            "bundle": report,
+            "bundle_status": report["status"],
+            "bundle_trusted": report["trusted"],
+            "bundle_blocked": report["blocked"],
+            "integrity_risks": risk,
+            "blocked_cases": blocked_cases,
+            "upgrade_cases": upgrade_cases,
+            "snapshot": repository.snapshot()}

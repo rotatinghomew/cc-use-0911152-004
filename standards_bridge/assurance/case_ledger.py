@@ -61,6 +61,15 @@ CREATE TABLE IF NOT EXISTS runs(
     started_at TEXT NOT NULL,
     finished_at TEXT
 );
+CREATE TABLE IF NOT EXISTS run_progress(
+    run_id TEXT NOT NULL,
+    record_id TEXT NOT NULL,
+    decision_id TEXT NOT NULL,
+    record_fingerprint TEXT NOT NULL,
+    record_version INTEGER NOT NULL,
+    recorded_at TEXT NOT NULL,
+    PRIMARY KEY(run_id, record_id)
+);
 CREATE INDEX IF NOT EXISTS idx_records_state ON records(state, updated_at);
 CREATE INDEX IF NOT EXISTS idx_events_aggregate ON events(aggregate_id, event_id);
 CREATE INDEX IF NOT EXISTS idx_decisions_record ON decisions(record_id, decided_at);
@@ -99,11 +108,44 @@ class Repository:
     def sign_case(self, certification_id: str, case_id: str, mapping_id: str,
                   evidence: dict[str, Any]) -> dict[str, Any]:
         with self.transaction() as connection:
-            return sign_case(connection, certification_id, case_id, mapping_id, evidence)
+            if not connection.execute("SELECT 1 FROM records WHERE record_id=?", (case_id,)).fetchone():
+                raise ContractError("unknown case")
+            result = sign_case(connection, certification_id, case_id, mapping_id, evidence)
+            self.append_event(connection, "case.signed", certification_id, 1,
+                              {"case_id": case_id, "mapping_id": mapping_id,
+                               "mapping_revision": result["mapping_revision"],
+                               "evidence_hash": result["evidence_hash"]})
+            return result
 
     def mapping_impact(self, mapping_id: str) -> dict[str, Any]:
         with self.connect() as connection:
             return mapping_impact(connection, mapping_id)
+
+    def certification(self, certification_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM certifications WHERE certification_id=?",
+                                     (certification_id,)).fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        try:
+            value["evidence"] = json.loads(value.pop("evidence_json", None) or "{}")
+        except json.JSONDecodeError:
+            value["evidence"] = {}
+        return value
+
+    def certification_rows(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute("SELECT * FROM certifications ORDER BY signed_at,certification_id").fetchall()
+        values = []
+        for row in rows:
+            value = dict(row)
+            try:
+                value["evidence"] = json.loads(value.pop("evidence_json", None) or "{}")
+            except json.JSONDecodeError:
+                value["evidence"] = {}
+            values.append(value)
+        return values
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -144,22 +186,26 @@ class Repository:
 
     def save_record(self, record: DomainRecord, expected_version: int | None = None) -> str:
         with self.transaction() as connection:
-            current = connection.execute("SELECT version,fingerprint FROM records WHERE record_id=?", (record.record_id,)).fetchone()
-            if current and expected_version is not None and current[0] != expected_version:
-                raise ContractError("optimistic version conflict")
-            if current and current[1] == record.fingerprint:
-                return record.fingerprint
-            if current and record.version <= current[0]:
-                raise ContractError("record version must advance")
-            payload = canonical_json(record.payload)
-            connection.execute("INSERT INTO records(record_id,version,state,payload_json,fingerprint,occurred_at,source,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(record_id) DO UPDATE SET version=excluded.version,state=excluded.state,payload_json=excluded.payload_json,fingerprint=excluded.fingerprint,occurred_at=excluded.occurred_at,source=excluded.source,updated_at=excluded.updated_at",
-                               (record.record_id, record.version, record.state, payload, record.fingerprint,
-                                record.occurred_at, record.source, utc_now()))
-            connection.execute("INSERT INTO record_versions(record_id,version,state,payload_json,fingerprint,stored_at) VALUES(?,?,?,?,?,?)",
-                               (record.record_id, record.version, record.state, payload, record.fingerprint, utc_now()))
-            self.append_event(connection, "record.saved", record.record_id, record.version,
-                              {"state": record.state, "fingerprint": record.fingerprint})
+            return self._save_record(connection, record, expected_version)
+
+    def _save_record(self, connection: sqlite3.Connection, record: DomainRecord,
+                     expected_version: int | None = None) -> str:
+        current = connection.execute("SELECT version,fingerprint FROM records WHERE record_id=?", (record.record_id,)).fetchone()
+        if current and expected_version is not None and current[0] != expected_version:
+            raise ContractError("optimistic version conflict")
+        if current and current[1] == record.fingerprint:
             return record.fingerprint
+        if current and record.version <= current[0]:
+            raise ContractError("record version must advance")
+        payload = canonical_json(record.payload)
+        connection.execute("INSERT INTO records(record_id,version,state,payload_json,fingerprint,occurred_at,source,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(record_id) DO UPDATE SET version=excluded.version,state=excluded.state,payload_json=excluded.payload_json,fingerprint=excluded.fingerprint,occurred_at=excluded.occurred_at,source=excluded.source,updated_at=excluded.updated_at",
+                           (record.record_id, record.version, record.state, payload, record.fingerprint,
+                            record.occurred_at, record.source, utc_now()))
+        connection.execute("INSERT INTO record_versions(record_id,version,state,payload_json,fingerprint,stored_at) VALUES(?,?,?,?,?,?)",
+                           (record.record_id, record.version, record.state, payload, record.fingerprint, utc_now()))
+        self.append_event(connection, "record.saved", record.record_id, record.version,
+                          {"state": record.state, "fingerprint": record.fingerprint})
+        return record.fingerprint
 
     def get_record(self, record_id: str) -> DomainRecord | None:
         with self.connect() as connection:
@@ -184,16 +230,19 @@ class Repository:
                              source=row["source"]) for row in rows]
 
     def save_decision(self, decision: Decision) -> str:
-        decision_id = decision.fingerprint
         with self.transaction() as connection:
-            if not connection.execute("SELECT 1 FROM records WHERE record_id=?", (decision.record_id,)).fetchone():
-                raise ContractError("decision record does not exist")
-            body = canonical_json(decision.as_dict())
-            connection.execute("INSERT OR IGNORE INTO decisions(decision_id,record_id,outcome,score,decision_json,decided_at) VALUES(?,?,?,?,?,?)",
-                               (decision_id, decision.record_id, decision.outcome, decision.score, body, decision.decided_at))
-            self.append_event(connection, "decision.saved", decision.record_id,
-                              self.event_count(decision.record_id, connection) + 1,
-                              {"decision_id": decision_id, "outcome": decision.outcome, "score": decision.score})
+            return self._save_decision(connection, decision)
+
+    def _save_decision(self, connection: sqlite3.Connection, decision: Decision) -> str:
+        decision_id = decision.fingerprint
+        if not connection.execute("SELECT 1 FROM records WHERE record_id=?", (decision.record_id,)).fetchone():
+            raise ContractError("decision record does not exist")
+        body = canonical_json(decision.as_dict())
+        connection.execute("INSERT OR IGNORE INTO decisions(decision_id,record_id,outcome,score,decision_json,decided_at) VALUES(?,?,?,?,?,?)",
+                           (decision_id, decision.record_id, decision.outcome, decision.score, body, decision.decided_at))
+        self.append_event(connection, "decision.saved", decision.record_id,
+                          self.event_count(decision.record_id, connection) + 1,
+                          {"decision_id": decision_id, "outcome": decision.outcome, "score": decision.score})
         return decision_id
 
     def event_count(self, aggregate_id: str, connection: sqlite3.Connection | None = None) -> int:
@@ -226,13 +275,132 @@ class Repository:
             raise ContractError("stored run result is invalid")
         return result
 
+    def run_progress(self, run_id: str) -> dict[str, dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute("SELECT * FROM run_progress WHERE run_id=? ORDER BY record_id",
+                                      (run_id,)).fetchall()
+        return {row["record_id"]: dict(row) for row in rows}
+
+    def record_progress(self, run_id: str, record: DomainRecord, decision: Decision) -> None:
+        """Persist one completed case so a crash resumes without duplicating work."""
+        with self.transaction() as connection:
+            changed = connection.execute(
+                "INSERT INTO run_progress(run_id,record_id,decision_id,record_fingerprint,record_version,recorded_at) "
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(run_id,record_id) DO UPDATE SET "
+                "decision_id=excluded.decision_id,record_fingerprint=excluded.record_fingerprint,"
+                "record_version=excluded.record_version,recorded_at=excluded.recorded_at",
+                (run_id, record.record_id, decision.fingerprint, record.fingerprint, record.version, utc_now()))
+            if changed.rowcount:
+                self.append_event(connection, "run.case_completed", run_id,
+                                  self.event_count(run_id, connection) + 1,
+                                  {"record_id": record.record_id, "decision_id": decision.fingerprint})
+
+    def reset_run(self, run_id: str) -> None:
+        """Re-open a finished run whose delivered bundle no longer matches the ledger.
+
+        Completed case progress is preserved on purpose: the cases were already
+        committed to the ledger, and re-processing them would mint duplicate
+        decisions and record versions.  The run is simply re-opened so the bundle
+        can be re-exported from the persisted facts.
+        """
+        with self.transaction() as connection:
+            connection.execute("UPDATE runs SET status='running',result_json='{}',finished_at=NULL WHERE run_id=?",
+                               (run_id,))
+            self.append_event(connection, "run.reopened", run_id,
+                              self.event_count(run_id, connection) + 1, {"reason": "bundle integrity"})
+
     def finish_run(self, run_id: str, result: Mapping[str, Any]) -> None:
         with self.transaction() as connection:
             changed = connection.execute("UPDATE runs SET status='finished',result_json=?,finished_at=? WHERE run_id=?",
                                          (canonical_json(result), utc_now(), run_id)).rowcount
             if changed != 1:
                 raise ContractError("unknown run")
-            self.append_event(connection, "run.finished", run_id, 1, dict(result))
+            self.append_event(connection, "run.finished", run_id,
+                              self.event_count(run_id, connection) + 1, dict(result))
+
+    def prepare_certification(self, certification_id: str, case_id: str, mapping_id: str,
+                              evidence: dict[str, Any]) -> None:
+        """Validate a planned signature without issuing it (used for reuse gating)."""
+        with self.connect() as connection:
+            prepare_certifications(connection)
+            if not connection.execute("SELECT 1 FROM case_mapping_usage WHERE case_id=? AND mapping_id=?",
+                                      (case_id, mapping_id)).fetchone():
+                raise ContractError("case has no recorded mapping dependency")
+            row = connection.execute("SELECT * FROM certifications WHERE certification_id=?",
+                                     (certification_id,)).fetchone()
+            if row is not None:
+                fingerprint = stable_hash({"case_id": case_id, "mapping_id": mapping_id,
+                                           "revision": row["mapping_revision"], "evidence": evidence})
+                if (row["case_id"], row["mapping_id"], row["mapping_revision"], row["evidence_hash"]) != (
+                        case_id, mapping_id, row["mapping_revision"], fingerprint):
+                    raise ContractError("signed certification cannot be overwritten")
+
+    def decision_row(self, record_id: str, decision_id: str | None = None) -> dict[str, Any] | None:
+        query = "SELECT decision_json FROM decisions WHERE record_id=?"
+        params: tuple[Any, ...] = (record_id,)
+        if decision_id:
+            query += " AND decision_id=?"
+            params = (record_id, decision_id)
+        query += " ORDER BY decided_at DESC LIMIT 1"
+        with self.connect() as connection:
+            row = connection.execute(query, params).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def decision_from_json(self, body: Mapping[str, Any]) -> Decision:
+        from standards_bridge.profiles.specification import RuleResult
+        return Decision(record_id=body["record_id"], outcome=body["outcome"], score=body["score"],
+                        reasons=tuple(body.get("reasons") or ()),
+                        rule_results=tuple(RuleResult(code=item["code"], passed=item["passed"],
+                                                      score=item["score"], severity=item["severity"],
+                                                      message=item["message"],
+                                                      evidence=dict(item.get("evidence") or {}))
+                                           for item in body.get("rules") or ()),
+                        metrics=dict(body.get("metrics") or {}),
+                        decided_at=body.get("decided_at") or utc_now())
+
+    def _record_progress(self, connection: sqlite3.Connection, run_id: str, record: DomainRecord,
+                         decision: Decision) -> None:
+        connection.execute(
+            "INSERT INTO run_progress(run_id,record_id,decision_id,record_fingerprint,record_version,recorded_at) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(run_id,record_id) DO UPDATE SET "
+            "decision_id=excluded.decision_id,record_fingerprint=excluded.record_fingerprint,"
+            "record_version=excluded.record_version,recorded_at=excluded.recorded_at",
+            (run_id, record.record_id, decision.fingerprint, record.fingerprint, record.version, utc_now()))
+        self.append_event(connection, "run.case_completed", run_id,
+                          self.event_count(run_id, connection) + 1,
+                          {"record_id": record.record_id, "decision_id": decision.fingerprint})
+
+    def commit_case(self, run_id: str, record: DomainRecord, build_decision,
+                    advance) -> tuple[DomainRecord, Decision]:
+        """Apply one case's record, decision, advancement and progress in one SQLite transaction.
+
+        The caller passes ``build_decision(stored, connection)`` and
+        ``advance(stored, decision)`` so business logic stays out of the ledger while
+        a crash can only leave a whole case or none of it.  This avoids nested
+        ``BEGIN IMMEDIATE`` calls that would otherwise deadlock on the write lock.
+        """
+        with self.transaction() as connection:
+            current_row = connection.execute(
+                "SELECT * FROM records WHERE record_id=?", (record.record_id,)).fetchone()
+            if current_row is None:
+                stored = record
+                self._save_record(connection, stored)
+            elif current_row["fingerprint"] == record.fingerprint:
+                stored = DomainRecord(record_id=current_row["record_id"],
+                                      payload=json.loads(current_row["payload_json"]),
+                                      state=current_row["state"], version=current_row["version"],
+                                      occurred_at=current_row["occurred_at"], source=current_row["source"])
+            else:
+                stored = DomainRecord(record.record_id, record.payload, current_row["state"],
+                                      current_row["version"] + 1, record.occurred_at, record.source)
+                self._save_record(connection, stored, expected_version=current_row["version"])
+            decision = build_decision(stored, connection)
+            self._save_decision(connection, decision)
+            advanced = advance(stored, decision)
+            if advanced.fingerprint != stored.fingerprint:
+                self._save_record(connection, advanced, expected_version=stored.version)
+            self._record_progress(connection, run_id, advanced, decision)
+            return advanced, decision
 
     def verify_chain(self) -> list[str]:
         errors: list[str] = []

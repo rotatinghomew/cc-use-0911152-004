@@ -22,8 +22,24 @@ def prepare_certifications(connection: sqlite3.Connection) -> None:
         certification_id TEXT PRIMARY KEY, case_id TEXT NOT NULL,
         mapping_id TEXT NOT NULL, mapping_revision INTEGER NOT NULL,
         evidence_hash TEXT NOT NULL, signed_at TEXT NOT NULL,
+        evidence_json TEXT NOT NULL DEFAULT '{}', bundle_id TEXT,
         FOREIGN KEY(mapping_id) REFERENCES standard_mappings(mapping_id)
     )""")
+    ensure_certification_evidence(connection)
+
+
+def ensure_certification_evidence(connection: sqlite3.Connection) -> None:
+    """Preserve the evidence body and bundle identity alongside an issued fact."""
+    try:
+        existing = {row[1] for row in connection.execute("PRAGMA table_info(certifications)")}
+    except sqlite3.DatabaseError:
+        return
+    if not existing:
+        return
+    if "evidence_json" not in existing:
+        connection.execute("ALTER TABLE certifications ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '{}'")
+    if "bundle_id" not in existing:
+        connection.execute("ALTER TABLE certifications ADD COLUMN bundle_id TEXT")
 
 
 def register_mapping(connection: sqlite3.Connection, mapping_id: str, source: str,
@@ -64,6 +80,7 @@ def sign_case(connection: sqlite3.Connection, certification_id: str, case_id: st
                               (case_id, mapping_id)).fetchone():
         raise ContractError("case has no recorded mapping dependency")
     revision = connection.execute("SELECT revision FROM standard_mappings WHERE mapping_id=?", (mapping_id,)).fetchone()[0]
+    body = canonical_json(evidence)
     fingerprint = stable_hash({"case_id": case_id, "mapping_id": mapping_id,
                                "revision": revision, "evidence": evidence})
     old = connection.execute("SELECT * FROM certifications WHERE certification_id=?", (certification_id,)).fetchone()
@@ -72,9 +89,13 @@ def sign_case(connection: sqlite3.Connection, certification_id: str, case_id: st
                 case_id, mapping_id, revision, fingerprint):
             raise ContractError("signed certification cannot be overwritten")
         return dict(old)
-    connection.execute("INSERT INTO certifications VALUES(?,?,?,?,?,?)",
-                       (certification_id, case_id, mapping_id, revision, fingerprint, utc_now()))
-    return dict(connection.execute("SELECT * FROM certifications WHERE certification_id=?", (certification_id,)).fetchone())
+    bundle_id = evidence.get("bundle_id") if isinstance(evidence.get("bundle_id"), str) else None
+    connection.execute(
+        "INSERT INTO certifications(certification_id,case_id,mapping_id,mapping_revision,evidence_hash,"
+        "signed_at,evidence_json,bundle_id) VALUES(?,?,?,?,?,?,?,?)",
+        (certification_id, case_id, mapping_id, revision, fingerprint, utc_now(), body, bundle_id))
+    return dict(connection.execute("SELECT * FROM certifications WHERE certification_id=?",
+                                   (certification_id,)).fetchone())
 
 
 def mapping_impact(connection: sqlite3.Connection, mapping_id: str) -> dict[str, Any]:
@@ -85,6 +106,7 @@ def mapping_impact(connection: sqlite3.Connection, mapping_id: str) -> dict[str,
     cases = [item[0] for item in connection.execute(
         "SELECT case_id FROM case_mapping_usage WHERE mapping_id=? ORDER BY case_id", (mapping_id,))]
     issued = [dict(item) for item in connection.execute(
-        "SELECT * FROM certifications WHERE mapping_id=? ORDER BY signed_at,certification_id", (mapping_id,))]
+        "SELECT certification_id,case_id,mapping_id,mapping_revision,evidence_hash,signed_at "
+        "FROM certifications WHERE mapping_id=? ORDER BY signed_at,certification_id", (mapping_id,))]
     return {"mapping_id": mapping_id, "revision": row["revision"], "aliases": json.loads(row["mapping_json"]),
             "affected_cases": cases, "signed_certifications": issued}
